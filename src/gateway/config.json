@@ -1,0 +1,18 @@
+{
+  "freq_hz": 169437500,
+  "sf": 12,
+  "bw_hz": 41700,
+  "cr_denom": 5,
+  "ldro": true,
+  "preamble": 8,
+  "sync_word": 18,
+  "crc_on": true,
+  "header": "explicit",
+  "implicit_len": 32,
+  "invert_iq_rx": true,
+  "invert_iq_tx": false,
+  "tx_power_dbm": 30,
+  "tx_pa": "pa_boost",
+  "rx_gain_mode": "boosted",
+  "rx_gain_level": "auto"
+}
