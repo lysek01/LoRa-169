@@ -1,0 +1,6 @@
+RPi.GPIO
+spidev
+paho-mqtt>=2.0,<3
+LoRaRF
+wheel
+setuptools
