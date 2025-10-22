@@ -261,7 +261,7 @@ def rx_handle_if_ready():
 
     mqtt_publish(MQTT_TOPIC_RX, {
         "timestamp": now_iso(),
-        "status_code": "0" + st,
+        "status_code": f"{int(st):02d}",
         "rssi": compute_rssi(rssi, snr),
         "snr": snr,
         "payload_hex": binascii.hexlify(data).decode("ascii"),
@@ -298,7 +298,7 @@ def do_tx_now(mode, data_bytes):
 
     mqtt_publish(MQTT_TOPIC_TX_ACK, {
         "timestamp": now_iso(),
-        "status_code": "0" + st,
+        "status_code": f"{int(st):02d}",
         "transmit_time": round(LoRa.transmitTime(), 1),
     })
 

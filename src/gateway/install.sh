@@ -5,8 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="$SCRIPT_DIR"
 VENV_DIR="$APP_DIR/venv"
 
-GATEWAY_ENTRY="src/gateway/lora_gateway.py"
-CONFIG_ENTRY="src/gateway/lora_config.py"
+GATEWAY_ENTRY="lora_gateway.py"
+CONFIG_ENTRY="lora_config.py"
 
 GW_SERVICE="loravsb-gateway.service"
 CFG_SERVICE="loravsb-config.service"
