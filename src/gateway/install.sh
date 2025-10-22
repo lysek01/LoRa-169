@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="https://github.com/lysek01/LoRa-169.git"
-BRANCH="main"
-
-APP_DIR="/opt/loravsb"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP_DIR="$SCRIPT_DIR"
 VENV_DIR="$APP_DIR/venv"
 
 GATEWAY_ENTRY="src/gateway/gateway.py"
@@ -20,27 +18,20 @@ PYTHON_BIN="python3"
 PIP_BIN="pip3"
 
 if [[ $EUID -ne 0 ]]; then
-  echo "Run as root $0"; exit 1
+  echo "Run as root: sudo bash $0"; exit 1
 fi
 
 if command -v apt-get >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y git "$PYTHON_BIN" python3-venv "$PIP_BIN"
+  apt-get install -y "$PYTHON_BIN" python3-venv "$PIP_BIN"
 fi
 
-mkdir -p "$APP_DIR"
-if [[ -d "$APP_DIR/.git" ]]; then
-  git -C "$APP_DIR" fetch --all --prune
-  git -C "$APP_DIR" checkout "$BRANCH"
-  git -C "$APP_DIR" reset --hard "origin/$BRANCH"
-else
-  git clone --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
-fi
-
+# ======= venv + pip =======
 "$PYTHON_BIN" -m venv "$VENV_DIR" 2>/dev/null || true
+# shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
-pip install --upgrade pip wheel
+pip install --upgrade pip wheel setuptools
 
 if [[ -f "$APP_DIR/requirements.txt" ]]; then
   pip install -r "$APP_DIR/requirements.txt"
@@ -51,11 +42,11 @@ fi
 GW_PATH="$APP_DIR/$GATEWAY_ENTRY"
 CFG_PATH="$APP_DIR/$CONFIG_ENTRY"
 [[ -f "$GW_PATH" ]] || { echo "Script not found: $GW_PATH"; exit 1; }
-[[ -f "$CFG_PATH" ]] || { echo "Script not found:  $CFG_PATH"; exit 1; }
+[[ -f "$CFG_PATH" ]] || { echo "Script not found: $CFG_PATH"; exit 1; }
 
 chown -R "$RUN_AS_USER:$RUN_AS_GROUP" "$APP_DIR"
 
-# ======= SYSTEMD: GATEWAY =======
+# ======= systemd: gateway =======
 cat > "/etc/systemd/system/$GW_SERVICE" <<EOF
 [Unit]
 Description=LoRa VSB Gateway
@@ -76,7 +67,7 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-# ======= SYSTEMD: CONFIG =======
+# ======= systemd: config =======
 cat > "/etc/systemd/system/$CFG_SERVICE" <<EOF
 [Unit]
 Description=LoRa VSB Config (MQTT)
@@ -97,9 +88,9 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
+# ======= enable + start =======
 systemctl daemon-reload
 systemctl enable "$GW_SERVICE" "$CFG_SERVICE"
 systemctl restart "$GW_SERVICE" "$CFG_SERVICE"
-
 
 echo "Done"
