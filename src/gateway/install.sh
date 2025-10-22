@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="$SCRIPT_DIR"
 VENV_DIR="$APP_DIR/venv"
 
-GATEWAY_ENTRY="src/gateway/gateway.py"
+GATEWAY_ENTRY="src/gateway/lora_gateway.py"
 CONFIG_ENTRY="src/gateway/lora_config.py"
 
 GW_SERVICE="loravsb-gateway.service"
@@ -15,7 +15,6 @@ RUN_AS_USER="admin"
 RUN_AS_GROUP="admin"
 
 PYTHON_BIN="python3"
-PIP_BIN="pip3"
 
 if [[ $EUID -ne 0 ]]; then
   echo "Run as root: sudo bash $0"; exit 1
@@ -24,7 +23,7 @@ fi
 if command -v apt-get >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y "$PYTHON_BIN" python3-venv "$PIP_BIN"
+  apt-get install -y git "$PYTHON_BIN" python3-venv
 fi
 
 # ======= venv + pip =======
