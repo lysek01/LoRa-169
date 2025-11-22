@@ -23,15 +23,12 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import paho.mqtt.client as mqtt
 
-MQTT_BROKER    = "158.196.109.41"
-MQTT_PORT      = 1883
+MQTT_CONFIG_PATH = "mqtt.conf"
 MQTT_TOPIC_RX  = "loravsb/169/rx"
 MQTT_TOPIC_TXH = "loravsb/169/tx/hex"
 MQTT_TOPIC_TXA = "loravsb/169/tx/ascii"
 MQTT_TOPIC_TX_ACK = "loravsb/169/tx/ack"
 MQTT_TOPIC_CONFIG_ACK = "loravsb/169/config/ack"
-MQTT_USERNAME  = "xxx"
-MQTT_PASSWORD  = "xxx"
 MQTT_QOS       = 1
 MQTT_KEEPALIVE = 60
 MQTT_CLIENT_ID = "lora-gw-169mhz"
@@ -46,6 +43,7 @@ CONFIG_PATH = "config.json"
 CONFIG_POLL_SEC = 30
 WAIT_TIMEOUT_S  = 0.001
 WAIT_SLEEP_S = 0.1
+BOOT_TIMEOUT_S = 10
 
 LoRa = None
 mqtt_client = None
@@ -127,6 +125,39 @@ def cfg_load_if_changed(prev_hash):
     h = _dict_hash(c)
     return (c, h, h != prev_hash)
 
+def mqtt_config_load():
+    cfg = {}
+
+    try:
+        with open(MQTT_CONFIG_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, val = line.split("=", 1)
+                    key = key.strip()
+                    val = val.strip()
+                    if key == "MQTT_BROKER":
+                        cfg["broker"] = val
+                    elif key == "MQTT_PORT":
+                        cfg["port"] = int(val)
+                    elif key == "MQTT_USERNAME":
+                        cfg["username"] = val
+                    elif key == "MQTT_PASSWORD":
+                        cfg["password"] = val
+    except FileNotFoundError:
+        raise RuntimeError(f"MQTT config file not found: {MQTT_CONFIG_PATH}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse MQTT config: {e}")
+
+    required = ["broker", "port"]
+    missing = [k for k in required if k not in cfg]
+    if missing:
+        raise RuntimeError(f"Missing required MQTT config keys: {', '.join(missing)}")
+
+    return cfg
+
 def map_rx_gain(mode, level):
     boost = SX127x.RX_GAIN_BOOSTED if str(mode).lower() == "boosted" else SX127x.RX_GAIN_POWER_SAVING
     if isinstance(level, str) and level.lower() == "auto":
@@ -148,8 +179,19 @@ def lora_init():
     l = SX127x()
     l.setSpi(SPI_BUS, SPI_CS, SPI_HZ)
     l.setPins(RST_PIN, DIO0_PIN)
-    l.begin()
-    return l
+
+    start_time = time.time()
+
+    while True:
+        if time.time() - start_time > BOOT_TIMEOUT_S:
+            raise RuntimeError(f"Failed to initialize module")
+
+        try:
+            if l.begin():
+                return l
+        except Exception:
+            pass
+        time.sleep(0.1)
 
 def lora_apply_common(c):
     LoRa.setFrequency(int(c["freq_hz"]))
@@ -200,11 +242,12 @@ def lora_soft_restart_and_apply(c):
 
 
 def mqtt_init():
+    mqtt_cfg = mqtt_config_load()
     c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=MQTT_CLIENT_ID)
-    if MQTT_USERNAME and MQTT_PASSWORD:
-        c.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+    if mqtt_cfg.get("username") and mqtt_cfg.get("password"):
+        c.username_pw_set(mqtt_cfg["username"], mqtt_cfg["password"])
     c.on_message = on_mqtt_message
-    c.connect(MQTT_BROKER, MQTT_PORT, keepalive=MQTT_KEEPALIVE)
+    c.connect(mqtt_cfg["broker"], mqtt_cfg["port"], keepalive=MQTT_KEEPALIVE)
     c.subscribe([(MQTT_TOPIC_TXH, MQTT_QOS),
                  (MQTT_TOPIC_TXA, MQTT_QOS)])
     c.loop_start()

@@ -49,7 +49,7 @@ chown -R "$RUN_AS_USER:$RUN_AS_GROUP" "$APP_DIR"
 cat > "/etc/systemd/system/$GW_SERVICE" <<EOF
 [Unit]
 Description=LoRa VSB Gateway
-After=network-online.target
+After=network-online.target sysinit.target
 Wants=network-online.target
 
 [Service]
@@ -59,8 +59,16 @@ Group=$RUN_AS_GROUP
 WorkingDirectory=$APP_DIR
 Environment=PYTHONUNBUFFERED=1
 ExecStart=$VENV_DIR/bin/python $GW_PATH
-Restart=always
-RestartSec=3
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+StartLimitInterval=60
+StartLimitBurst=3
+
+# Timeouts
+TimeoutStartSec=20
+TimeoutStopSec=10
 
 [Install]
 WantedBy=multi-user.target
@@ -80,8 +88,16 @@ Group=$RUN_AS_GROUP
 WorkingDirectory=$APP_DIR
 Environment=PYTHONUNBUFFERED=1
 ExecStart=$VENV_DIR/bin/python $CFG_PATH
-Restart=always
+
+# Restart policy (mírnější než gateway - žádný hardware)
+Restart=on-failure
 RestartSec=3
+StartLimitInterval=60
+StartLimitBurst=5
+
+# Timeouts
+TimeoutStartSec=10
+TimeoutStopSec=5
 
 [Install]
 WantedBy=multi-user.target

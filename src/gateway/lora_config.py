@@ -3,13 +3,10 @@ from datetime import datetime, timezone
 import paho.mqtt.client as mqtt
 from zoneinfo import ZoneInfo
 
-CFG_PATH    = "config.json"
-MQTT_HOST   = "158.196.109.41"
-MQTT_PORT   = 1883
-MQTT_USER   = "xxx"
-MQTT_PASS   = "xxx"
-TLS_ENABLED = False
-QOS         = 1
+CFG_PATH         = "config.json"
+MQTT_CONFIG_PATH = "mqtt.conf"
+TLS_ENABLED      = False
+QOS              = 1
 
 TOPIC_GET       = "loravsb/169/config/get"
 TOPIC_SET       = "loravsb/169/config/set"
@@ -29,6 +26,39 @@ lock = threading.RLock()
 
 def now_iso():
     return datetime.now(ZoneInfo("Europe/Prague")).isoformat()
+
+def load_mqtt_config():
+    cfg = {}
+
+    try:
+        with open(MQTT_CONFIG_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, val = line.split("=", 1)
+                    key = key.strip()
+                    val = val.strip()
+                    if key == "MQTT_BROKER":
+                        cfg["broker"] = val
+                    elif key == "MQTT_PORT":
+                        cfg["port"] = int(val)
+                    elif key == "MQTT_USERNAME":
+                        cfg["username"] = val
+                    elif key == "MQTT_PASSWORD":
+                        cfg["password"] = val
+    except FileNotFoundError:
+        raise RuntimeError(f"MQTT config file not found: {MQTT_CONFIG_PATH}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse MQTT config: {e}")
+
+    required = ["broker", "port"]
+    missing = [k for k in required if k not in cfg]
+    if missing:
+        raise RuntimeError(f"Missing required MQTT config keys: {', '.join(missing)}")
+
+    return cfg
 
 def load_cfg():
     if not os.path.exists(CFG_PATH):
@@ -69,18 +99,25 @@ def deep_merge(dst: dict, src: dict) -> dict:
     return dst
 
 # ---- MQTT ----
-client = mqtt.Client(
-    client_id="cfg-shadow-loravsb-169",
-    userdata=None,
-    protocol=mqtt.MQTTv311,
-    transport="tcp",
-    callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-)
+def init_mqtt_client():
+    mqtt_cfg = load_mqtt_config()
 
-if MQTT_USER:
-    client.username_pw_set(MQTT_USER, MQTT_PASS)
-if TLS_ENABLED:
-    client.tls_set()
+    client = mqtt.Client(
+        client_id="cfg-shadow-loravsb-169",
+        userdata=None,
+        protocol=mqtt.MQTTv311,
+        transport="tcp",
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+    )
+
+    if mqtt_cfg.get("username") and mqtt_cfg.get("password"):
+        client.username_pw_set(mqtt_cfg["username"], mqtt_cfg["password"])
+    if TLS_ENABLED:
+        client.tls_set()
+
+    return client, mqtt_cfg
+
+client, mqtt_cfg = init_mqtt_client()
 
 def on_connect(cl, userdata, flags, rc, properties=None):
     if rc == 0:
@@ -123,7 +160,7 @@ client.on_connect = on_connect
 client.on_message = on_message
 
 def main():
-    client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+    client.connect(mqtt_cfg["broker"], mqtt_cfg["port"], keepalive=60)
     client.loop_start()
     try:
         while True:
