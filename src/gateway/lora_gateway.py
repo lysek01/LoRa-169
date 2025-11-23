@@ -22,6 +22,7 @@ import hashlib
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import paho.mqtt.client as mqtt
+import RPi.GPIO as GPIO
 
 MQTT_CONFIG_PATH = "mqtt.conf"
 MQTT_TOPIC_RX  = "loravsb/169/rx"
@@ -176,6 +177,11 @@ def map_pa(pa_str):
 
 
 def lora_init():
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    GPIO.setup(RST_PIN, GPIO.OUT, initial=GPIO.HIGH)
+    time.sleep(0.01)
+
     l = SX127x()
     l.setSpi(SPI_BUS, SPI_CS, SPI_HZ)
     l.setPins(RST_PIN, DIO0_PIN)

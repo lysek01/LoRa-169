@@ -34,7 +34,10 @@ Shadow configuration service for remote MQTT-based configuration updates.
 ### 3. **config.json** - Radio Configuration
 LoRa radio parameters (frequency, spreading factor, bandwidth, coding rate, etc.)
 
-### 4. **install.sh** - Installation Script
+### 4. **mqtt.conf** - MQTT Broker Configuration
+MQTT connection settings (broker address, port, credentials). Edit this file with your actual broker settings before deployment.
+
+### 5. **install.sh** - Installation Script
 Automated setup script that installs dependencies and creates systemd services.
 
 ## Radio Configuration Parameters
@@ -96,8 +99,37 @@ Automated setup script that installs dependencies and creates systemd services.
 
 ## Installation
 
+### 1. Configure MQTT Connection
+
+Before running the installation, edit the MQTT configuration file with your broker settings:
+
 ```bash
 cd /path/to/gateway
+nano mqtt.conf
+```
+
+Configure your MQTT broker settings:
+```ini
+# MQTT Broker Configuration
+MQTT_BROKER=192.168.1.100    # Your MQTT broker IP/hostname
+MQTT_PORT=1883                # MQTT port (usually 1883)
+MQTT_USERNAME=your_username   # MQTT username (optional)
+MQTT_PASSWORD=your_password   # MQTT password (optional)
+```
+
+**Required parameters:**
+- `MQTT_BROKER` - Broker IP address or hostname
+- `MQTT_PORT` - Broker port number
+
+**Optional parameters:**
+- `MQTT_USERNAME` - Username for authentication
+- `MQTT_PASSWORD` - Password for authentication
+
+**Important:** The repository contains `mqtt.conf` with example values. Edit this file with your actual broker credentials before deployment.
+
+### 2. Run Installation Script
+
+```bash
 sudo bash install.sh
 ```
 
@@ -109,8 +141,14 @@ The script will:
 5. Enable and start services
 
 **Services Created:**
-- `loravsb-gateway.service` - Main gateway (port 1883)
-- `loravsb-config.service` - Configuration manager
+- `loravsb-gateway.service` - Main gateway service
+- `loravsb-config.service` - Configuration manager service
+
+**Service Features:**
+- **Auto-restart on failure** - Services restart automatically if they crash
+- **Boot timeout protection** - 10s timeout for LoRa module initialization
+- **Start limit protection** - Max 3 restart attempts per minute (gateway), 5 attempts (config)
+- **Proper GPIO initialization** - RST pin set to known state before module init
 
 ## Hardware Requirements
 
@@ -185,7 +223,8 @@ sudo systemctl disable loravsb-config
 ### File Structure
 ```
 gateway/
-├── config.json              # Radio configuration
+├── config.json              # Radio configuration (LoRa parameters)
+├── mqtt.conf                # MQTT broker configuration (edit before install)
 ├── lora_gateway.py          # Main gateway service
 ├── lora_config.py           # Config management service
 ├── install.sh               # Installation script
@@ -193,20 +232,23 @@ gateway/
 ```
 
 ### Main Gateway Service Flow
-1. Load configuration from config.json
-2. Initialize SX127x radio via SPI
-3. Connect to MQTT broker
-4. Enter main loop:
+1. Load MQTT configuration from mqtt.conf
+2. Load radio configuration from config.json
+3. Initialize GPIO (set RST pin to known state)
+4. Initialize SX127x radio via SPI with timeout/retry logic
+5. Connect to MQTT broker
+6. Enter main loop:
    - Check for configuration changes (reload if needed)
    - Check for received LoRa packets
    - Process pending transmissions
    - Handle MQTT messages
 
 ### Configuration Service Flow
-1. Connect to MQTT broker
-2. Subscribe to config GET/SET topics
-3. Publish initial configuration state
-4. Wait for incoming messages:
+1. Load MQTT configuration from mqtt.conf
+2. Connect to MQTT broker
+3. Subscribe to config GET/SET topics
+4. Publish initial configuration state
+5. Wait for incoming messages:
    - **GET**: Publish current config.json
    - **SET**: Merge changes into config.json atomically
 
@@ -249,27 +291,40 @@ MQTT → loravsb/169/config/set → lora_config.py → config.json
 ### Gateway Not Starting
 **Symptoms:** Service fails to start or crashes immediately
 
+**Common Error Messages:**
+- `RuntimeError: MQTT config file not found: mqtt.conf` - Missing MQTT configuration
+- `RuntimeError: Missing required MQTT config keys: broker` - Invalid mqtt.conf
+- `RuntimeError: Failed to initialize module` - LoRa module not responding
+
 **Possible Causes:**
-1. SPI interface not enabled
-2. Incorrect GPIO pin connections
-3. Missing dependencies
-4. Permission issues
+1. **Missing mqtt.conf** - MQTT configuration file doesn't exist
+2. **Invalid mqtt.conf** - Missing required keys (MQTT_BROKER, MQTT_PORT)
+3. **LoRa module not responding** - Hardware issue or timing problem
+4. **SPI interface not enabled** - Raspberry Pi SPI disabled
+5. **Incorrect GPIO pin connections** - Wrong wiring
+6. **Missing dependencies** - Python packages not installed
 
 **Solutions:**
 ```bash
-# Enable SPI on Raspberry Pi
+# 1. Check and edit mqtt.conf
+nano /path/to/gateway/mqtt.conf
+
+# 2. Verify mqtt.conf has required keys
+cat mqtt.conf | grep -E "MQTT_BROKER|MQTT_PORT"
+
+# 3. Check service logs for detailed error
+sudo journalctl -u loravsb-gateway -n 50
+
+# 4. Enable SPI on Raspberry Pi
 sudo raspi-config
 # Navigate to: Interface Options → SPI → Enable
 
-# Check service logs
-sudo journalctl -u loravsb-gateway -n 50
+# 5. Verify Python dependencies
+source venv/bin/activate
+pip list | grep -E "LoRaRF|paho-mqtt|RPi.GPIO"
 
-# Verify Python dependencies
-source /opt/loravsb/venv/bin/activate
-pip list
-
-# Check file permissions
-ls -la /opt/loravsb/
+# 6. Test LoRa module manually
+python3 -c "from LoRaRF import SX127x; import time; l = SX127x(); l.setSpi(0,0,1000000); l.setPins(25,5); time.sleep(0.1); print('OK' if l.begin() else 'FAIL')"
 ```
 
 ### No Packets Received
