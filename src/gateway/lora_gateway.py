@@ -179,6 +179,7 @@ def map_pa(pa_str):
 def lora_init():
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
+    GPIO.setup(DIO0_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
     GPIO.setup(RST_PIN, GPIO.OUT, initial=GPIO.HIGH)
     time.sleep(0.01)
 
@@ -377,10 +378,10 @@ def main():
                 tx_pending = False
                 do_tx_now(mode, data)
 
-            try:
-                LoRa.request()
-            except Exception:
-                pass
+#            try:
+#                LoRa.request()
+#            except Exception:
+#                pass
 
             ok = LoRa.wait(WAIT_TIMEOUT_S)
 
