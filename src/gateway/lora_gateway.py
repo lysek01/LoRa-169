@@ -46,6 +46,15 @@ WAIT_TIMEOUT_S  = 0.001
 WAIT_SLEEP_S = 0.1
 BOOT_TIMEOUT_S = 10
 
+RX_RATE_WINDOW = 1.0
+RX_RATE_THRESHOLD_HIGH = 20
+RX_RATE_THRESHOLD_EXTREME = 100
+RX_SAME_PAYLOAD_THRESHOLD = 5
+RX_SAME_STATUS_THRESHOLD = 5
+RX_SAME_PAYLOAD_EXTREME = 20
+RECOVERY_SLEEP_S = 0.05
+TX_TIMEOUT_S = 60
+
 LoRa = None
 mqtt_client = None
 cfg = None
@@ -54,6 +63,12 @@ cfg_hash = None
 tx_pending = False
 tx_mode = None
 tx_bytes_buf = b""
+
+rx_events = []
+last_payload_hash = None
+same_payload_count = 0
+last_status = None
+same_status_count = 0
 
 
 def now_iso():
@@ -280,18 +295,88 @@ def on_mqtt_message(client, userdata, msg):
         tx_pending = True
 
 
+def detect_rx_loop(now, payload_hash, st):
+    global rx_events, last_payload_hash, same_payload_count
+    global last_status, same_status_count
+
+    rx_events.append(now)
+    rx_events[:] = [t for t in rx_events if now - t < RX_RATE_WINDOW]
+
+    if payload_hash == last_payload_hash:
+        same_payload_count += 1
+    else:
+        same_payload_count = 0
+        last_payload_hash = payload_hash
+
+    if st == last_status:
+        same_status_count += 1
+    else:
+        same_status_count = 0
+        last_status = st
+
+    if (len(rx_events) > RX_RATE_THRESHOLD_HIGH and
+        same_payload_count > RX_SAME_PAYLOAD_THRESHOLD and
+        same_status_count > RX_SAME_STATUS_THRESHOLD):
+        return True
+
+    if len(rx_events) > RX_RATE_THRESHOLD_EXTREME:
+        return True
+
+    if same_payload_count > RX_SAME_PAYLOAD_EXTREME:
+        return True
+
+    return False
+
+
+def perform_rx_recovery():
+    global rx_events, same_payload_count, same_status_count
+
+    try:
+        LoRa.standby()
+        time.sleep(RECOVERY_SLEEP_S)
+        LoRa.request(LoRa.RX_CONTINUOUS)
+    except Exception:
+        pass
+
+    rx_events.clear()
+    same_payload_count = 0
+    same_status_count = 0
+
+
 def rx_handle_if_ready():
     if LoRa.available() <= 0:
         return
+
     buf = bytearray()
     while LoRa.available() > 0:
         buf.append(LoRa.read())
     data = bytes(buf)
 
     try:
+        LoRa.purge()
+    except:
+        LoRa._payloadTxRx = 0
+
+    try:
+        st = LoRa.status()
+        st = int(st) if isinstance(st, int) else st
+    except Exception:
+        st = None
+
+    now = time.time()
+    payload_hash = hashlib.md5(data).digest()[:4] if len(data) > 0 else b"\x00\x00\x00\x00"
+
+    loop_detected = detect_rx_loop(now, payload_hash, st)
+
+    if loop_detected:
+        perform_rx_recovery()
+        return
+
+    try:
         rssi = float(LoRa.packetRssi())
     except Exception:
         rssi = None
+
     try:
         snr_bind = LoRa.snr()
         if snr_bind is None:
@@ -303,28 +388,25 @@ def rx_handle_if_ready():
             snr = q / 4.0
     except Exception:
         snr = None
-    try:
-        st = LoRa.status()
-        st = int(st) if isinstance(st, int) else st
-    except Exception:
-        st = None
 
     mqtt_publish(MQTT_TOPIC_RX, {
         "timestamp": now_iso(),
         "status_code": f"{int(st):02d}" if st is not None else "FF",
         "rssi": compute_rssi(rssi, snr),
         "snr": snr,
-        "payload_hex": binascii.hexlify(data).decode("ascii"),
-        "payload_ascii": ascii_safe_preview(data)
+        "payload_hex": binascii.hexlify(data).decode("ascii") if len(data) > 0 else "",
+        "payload_ascii": ascii_safe_preview(data) if len(data) > 0 else ""
     })
 
 def do_tx_now(mode, data_bytes):
+    st = None
     try:
         set_tx_iq(cfg)
         LoRa.beginPacket()
         for b in data_bytes:
             LoRa.write(b)
         LoRa.endPacket()
+        tx_start = time.time()
         while True:
              if LoRa.wait(WAIT_TIMEOUT_S):
                  try:
@@ -334,6 +416,10 @@ def do_tx_now(mode, data_bytes):
                  if st is not None:
                      st = int(st) if isinstance(st, int) else st
                      break
+
+             if time.time() - tx_start > TX_TIMEOUT_S:
+                 st = 2
+                 break
 
              time.sleep(WAIT_SLEEP_S)
 
@@ -356,6 +442,27 @@ def do_tx_now(mode, data_bytes):
         "status_code": f"{int(st):02d}" if st is not None else "FF",
         "transmit_time": tx_time,
     })
+
+
+def check_and_apply_config(last_cfg_check):
+    global cfg, cfg_hash
+
+    now = time.time()
+    if now - last_cfg_check < CONFIG_POLL_SEC:
+        return last_cfg_check
+
+    newc, newh, changed = cfg_load_if_changed(cfg_hash)
+    if changed:
+        cfg = newc
+        cfg_hash = newh
+        lora_soft_restart_and_apply(cfg)
+
+        mqtt_publish(MQTT_TOPIC_CONFIG_ACK, {
+            "timestamp": now_iso(),
+            "status_code": 13,
+        })
+
+    return now
 
 
 def main():
@@ -390,19 +497,7 @@ def main():
             else:
                 time.sleep(WAIT_SLEEP_S)
 
-            now = time.time()
-            if now - last_cfg_check >= CONFIG_POLL_SEC:
-                last_cfg_check = now
-                newc, newh, changed = cfg_load_if_changed(cfg_hash)
-                if changed:
-                    cfg = newc
-                    cfg_hash = newh
-                    lora_soft_restart_and_apply(cfg)
-
-                    mqtt_publish(MQTT_TOPIC_CONFIG_ACK, {
-                        "timestamp": now_iso(),
-                        "status_code": 13,
-                    })
+            last_cfg_check = check_and_apply_config(last_cfg_check)
 
     except KeyboardInterrupt:
         pass
