@@ -243,7 +243,7 @@ def lora_soft_restart_and_apply(c):
     set_rx_iq(c)
     time.sleep(0.02)
     try:
-        LoRa.request()
+        LoRa.request(LoRa.RX_CONTINUOUS)
     except Exception:
         pass
 
@@ -311,7 +311,7 @@ def rx_handle_if_ready():
 
     mqtt_publish(MQTT_TOPIC_RX, {
         "timestamp": now_iso(),
-        "status_code": f"{int(st):02d}",
+        "status_code": f"{int(st):02d}" if st is not None else "FF",
         "rssi": compute_rssi(rssi, snr),
         "snr": snr,
         "payload_hex": binascii.hexlify(data).decode("ascii"),
@@ -342,14 +342,19 @@ def do_tx_now(mode, data_bytes):
     finally:
         set_rx_iq(cfg)
         try:
-            LoRa.request()
+            LoRa.request(LoRa.RX_CONTINUOUS)
         except Exception:
             pass
 
+    try:
+        tx_time = round(LoRa.transmitTime(), 1)
+    except Exception:
+        tx_time = 0.0
+
     mqtt_publish(MQTT_TOPIC_TX_ACK, {
         "timestamp": now_iso(),
-        "status_code": f"{int(st):02d}",
-        "transmit_time": round(LoRa.transmitTime(), 1),
+        "status_code": f"{int(st):02d}" if st is not None else "FF",
+        "transmit_time": tx_time,
     })
 
 
@@ -364,7 +369,7 @@ def main():
     lora_apply_common(cfg)
     set_rx_iq(cfg)
     try:
-        LoRa.request()
+        LoRa.request(LoRa.RX_CONTINUOUS)
     except Exception:
         pass
 
@@ -377,11 +382,6 @@ def main():
                 data = tx_bytes_buf
                 tx_pending = False
                 do_tx_now(mode, data)
-
-#            try:
-#                LoRa.request()
-#            except Exception:
-#                pass
 
             ok = LoRa.wait(WAIT_TIMEOUT_S)
 
