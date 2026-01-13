@@ -23,6 +23,11 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import paho.mqtt.client as mqtt
 import RPi.GPIO as GPIO
+import logging
+import os
+
+LOG_DIR = "logs"
+LOG_FILE = None
 
 MQTT_CONFIG_PATH = "mqtt.conf"
 MQTT_TOPIC_RX  = "loravsb/169/rx"
@@ -70,6 +75,26 @@ same_payload_count = 0
 last_status = None
 same_status_count = 0
 
+
+def setup_logging():
+    global LOG_FILE
+    if not os.path.exists(LOG_DIR):
+        os.makedirs(LOG_DIR)
+
+    timestamp = datetime.now(ZoneInfo("Europe/Prague")).strftime("%Y%m%d_%H%M%S")
+    LOG_FILE = os.path.join(LOG_DIR, f"lora_gateway_{timestamp}.log")
+
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S.%f',
+        handlers=[
+            logging.FileHandler(LOG_FILE, encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+    logging.info(f"=== LoRa Gateway Started ===")
+    logging.info(f"Log file: {LOG_FILE}")
 
 def now_iso():
     return datetime.now(ZoneInfo("Europe/Prague")).isoformat()
@@ -126,14 +151,16 @@ def _dict_hash(d):
 
 def cfg_load():
     base = cfg_defaults()
+    logging.debug(f"Loading config from {CONFIG_PATH}")
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         for k in base.keys():
             if k in data:
                 base[k] = data[k]
-    except Exception:
-        pass
+        logging.info(f"Config loaded successfully: {json.dumps(base, indent=2)}")
+    except Exception as e:
+        logging.warning(f"Failed to load config file, using defaults: {e}")
     return cfg_enforce_169(base)
 
 def cfg_load_if_changed(prev_hash):
@@ -143,6 +170,7 @@ def cfg_load_if_changed(prev_hash):
 
 def mqtt_config_load():
     cfg = {}
+    logging.debug(f"Loading MQTT config from {MQTT_CONFIG_PATH}")
 
     try:
         with open(MQTT_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -163,15 +191,19 @@ def mqtt_config_load():
                     elif key == "MQTT_PASSWORD":
                         cfg["password"] = val
     except FileNotFoundError:
+        logging.error(f"MQTT config file not found: {MQTT_CONFIG_PATH}")
         raise RuntimeError(f"MQTT config file not found: {MQTT_CONFIG_PATH}")
     except Exception as e:
+        logging.error(f"Failed to parse MQTT config: {e}")
         raise RuntimeError(f"Failed to parse MQTT config: {e}")
 
     required = ["broker", "port"]
     missing = [k for k in required if k not in cfg]
     if missing:
+        logging.error(f"Missing required MQTT config keys: {', '.join(missing)}")
         raise RuntimeError(f"Missing required MQTT config keys: {', '.join(missing)}")
 
+    logging.info(f"MQTT config loaded: broker={cfg['broker']}, port={cfg['port']}")
     return cfg
 
 def map_rx_gain(mode, level):
@@ -192,6 +224,8 @@ def map_pa(pa_str):
 
 
 def lora_init():
+    logging.info("Initializing LoRa module...")
+    logging.debug(f"GPIO setup: RST_PIN={RST_PIN}, DIO0_PIN={DIO0_PIN}")
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
     GPIO.setup(DIO0_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
@@ -199,6 +233,7 @@ def lora_init():
     time.sleep(0.01)
 
     l = SX127x()
+    logging.debug(f"SPI setup: BUS={SPI_BUS}, CS={SPI_CS}, HZ={SPI_HZ}")
     l.setSpi(SPI_BUS, SPI_CS, SPI_HZ)
     l.setPins(RST_PIN, DIO0_PIN)
 
@@ -206,90 +241,130 @@ def lora_init():
 
     while True:
         if time.time() - start_time > BOOT_TIMEOUT_S:
+            logging.error(f"Failed to initialize module after {BOOT_TIMEOUT_S}s timeout")
             raise RuntimeError(f"Failed to initialize module")
 
         try:
             if l.begin():
+                logging.info("LoRa module initialized successfully")
                 return l
-        except Exception:
+        except Exception as e:
+            logging.debug(f"LoRa init attempt failed: {e}")
             pass
         time.sleep(0.1)
 
 def lora_apply_common(c):
+    logging.debug("Applying LoRa configuration...")
+    logging.debug(f"  Frequency: {c['freq_hz']} Hz")
     LoRa.setFrequency(int(c["freq_hz"]))
+    logging.debug(f"  Modulation: SF={c['sf']}, BW={c['bw_hz']} Hz, CR=4/{c['cr_denom']}, LDRO={c['ldro']}")
     LoRa.setLoRaModulation(int(c["sf"]), int(c["bw_hz"]), int(c["cr_denom"]), bool(c["ldro"]))
     header = LoRa.HEADER_EXPLICIT if str(c.get("header", "explicit")).lower() == "explicit" else LoRa.HEADER_IMPLICIT
     payload_len = 255 if header == LoRa.HEADER_EXPLICIT else int(c.get("implicit_len", 32))
+    logging.debug(f"  Packet: header={'explicit' if header == LoRa.HEADER_EXPLICIT else 'implicit'}, preamble={c['preamble']}, len={payload_len}, crc={c['crc_on']}")
     LoRa.setLoRaPacket(header, int(c["preamble"]), payload_len, bool(c["crc_on"]), False)
+    logging.debug(f"  Sync word: 0x{c['sync_word']:02X}")
     LoRa.setSyncWord(int(c["sync_word"]))
+    logging.debug(f"  TX power: {c['tx_power_dbm']} dBm, PA={c['tx_pa']}")
     LoRa.setTxPower(int(c["tx_power_dbm"]), map_pa(c["tx_pa"]))
     boost, lvl = map_rx_gain(c["rx_gain_mode"], c["rx_gain_level"])
+    logging.debug(f"  RX gain: mode={c['rx_gain_mode']}, level={c['rx_gain_level']}")
     LoRa.setRxGain(boost, lvl)
+    logging.info("LoRa configuration applied successfully")
 
 def set_rx_iq(c):
     try:
-        LoRa.setInvertIq(bool(c["invert_iq_rx"]))
-    except Exception:
+        invert = bool(c["invert_iq_rx"])
+        LoRa.setInvertIq(invert)
+        logging.debug(f"Set RX IQ invert: {invert}")
+    except Exception as e:
+        logging.warning(f"Failed to set RX IQ invert: {e}")
         pass
 
 def set_tx_iq(c):
     try:
-        LoRa.setInvertIq(bool(c["invert_iq_tx"]))
-    except Exception:
+        invert = bool(c["invert_iq_tx"])
+        LoRa.setInvertIq(invert)
+        logging.debug(f"Set TX IQ invert: {invert}")
+    except Exception as e:
+        logging.warning(f"Failed to set TX IQ invert: {e}")
         pass
 
 def lora_soft_restart_and_apply(c):
+    logging.warning("Performing LoRa soft restart...")
     try:
         LoRa.restart()
-    except Exception:
+        logging.debug("LoRa restart() successful")
+    except Exception as e:
+        logging.warning(f"LoRa restart() failed: {e}, trying sleep/wake")
         try:
             LoRa.sleep()
             time.sleep(0.02)
             LoRa.wake()
-        except Exception:
+            logging.debug("LoRa sleep/wake successful")
+        except Exception as e2:
+            logging.error(f"LoRa sleep/wake failed: {e2}")
             pass
     time.sleep(0.02)
 
     try:
         LoRa.init()
-    except Exception:
+        logging.debug("LoRa init() successful")
+    except Exception as e:
+        logging.warning(f"LoRa init() failed: {e}, trying begin()")
         LoRa.begin()
     lora_apply_common(c)
     set_rx_iq(c)
     time.sleep(0.02)
     try:
         LoRa.request(LoRa.RX_CONTINUOUS)
-    except Exception:
+        logging.info("LoRa soft restart completed, back to RX_CONTINUOUS mode")
+    except Exception as e:
+        logging.error(f"Failed to set RX_CONTINUOUS after restart: {e}")
         pass
 
 
 def mqtt_init():
+    logging.info("Initializing MQTT client...")
     mqtt_cfg = mqtt_config_load()
     c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=MQTT_CLIENT_ID)
     if mqtt_cfg.get("username") and mqtt_cfg.get("password"):
         c.username_pw_set(mqtt_cfg["username"], mqtt_cfg["password"])
+        logging.debug("MQTT authentication configured")
     c.on_message = on_mqtt_message
+    logging.info(f"Connecting to MQTT broker {mqtt_cfg['broker']}:{mqtt_cfg['port']}")
     c.connect(mqtt_cfg["broker"], mqtt_cfg["port"], keepalive=MQTT_KEEPALIVE)
+    logging.debug(f"Subscribing to topics: {MQTT_TOPIC_TXH}, {MQTT_TOPIC_TXA}")
     c.subscribe([(MQTT_TOPIC_TXH, MQTT_QOS),
                  (MQTT_TOPIC_TXA, MQTT_QOS)])
     c.loop_start()
+    logging.info("MQTT client initialized and running")
     return c
 
 def mqtt_publish(topic, obj):
-    mqtt_client.publish(topic, json.dumps(obj, ensure_ascii=False), qos=MQTT_QOS, retain=False)
+    payload = json.dumps(obj, ensure_ascii=False)
+    logging.debug(f"MQTT publish to {topic}: {payload}")
+    mqtt_client.publish(topic, payload, qos=MQTT_QOS, retain=False)
 
 def on_mqtt_message(client, userdata, msg):
     global tx_pending, tx_mode, tx_bytes_buf
+    logging.info(f"MQTT message received on topic: {msg.topic}")
     if msg.topic == MQTT_TOPIC_TXH:
         try:
-            data = binascii.unhexlify(msg.payload.decode("utf-8").strip())
-        except Exception:
+            payload_str = msg.payload.decode("utf-8").strip()
+            logging.debug(f"TX HEX payload: {payload_str}")
+            data = binascii.unhexlify(payload_str)
+            logging.info(f"TX HEX request: {len(data)} bytes")
+        except Exception as e:
+            logging.error(f"Failed to decode HEX payload: {e}")
             mqtt_publish(MQTT_TOPIC_TX_ACK, {"timestamp": now_iso(), "status_code": None})
             return
         tx_mode = "hex"
         tx_bytes_buf = data
         tx_pending = True
     elif msg.topic == MQTT_TOPIC_TXA:
+        logging.debug(f"TX ASCII payload: {msg.payload[:100]}")
+        logging.info(f"TX ASCII request: {len(msg.payload)} bytes")
         tx_mode = "ascii"
         tx_bytes_buf = bytes(msg.payload)
         tx_pending = True
@@ -314,15 +389,20 @@ def detect_rx_loop(now, payload_hash, st):
         same_status_count = 0
         last_status = st
 
+    logging.debug(f"Loop detection: events={len(rx_events)}, same_payload={same_payload_count}, same_status={same_status_count}")
+
     if (len(rx_events) > RX_RATE_THRESHOLD_HIGH and
         same_payload_count > RX_SAME_PAYLOAD_THRESHOLD and
         same_status_count > RX_SAME_STATUS_THRESHOLD):
+        logging.warning(f"Loop detected: high rate ({len(rx_events)} events) + same payload ({same_payload_count}) + same status ({same_status_count})")
         return True
 
     if len(rx_events) > RX_RATE_THRESHOLD_EXTREME:
+        logging.warning(f"Loop detected: extreme rate ({len(rx_events)} events in {RX_RATE_WINDOW}s window)")
         return True
 
     if same_payload_count > RX_SAME_PAYLOAD_EXTREME:
+        logging.warning(f"Loop detected: extreme same payload count ({same_payload_count})")
         return True
 
     return False
@@ -331,36 +411,49 @@ def detect_rx_loop(now, payload_hash, st):
 def perform_rx_recovery():
     global rx_events, same_payload_count, same_status_count
 
+    logging.warning("!!! PERFORMING RX RECOVERY DUE TO LOOP DETECTION !!!")
     try:
-        LoRa.standby()
-        time.sleep(RECOVERY_SLEEP_S)
-        LoRa.request(LoRa.RX_CONTINUOUS)
-    except Exception:
+        lora_soft_restart_and_apply(cfg)
+        logging.info("RX recovery completed successfully")
+    except Exception as e:
+        logging.error(f"RX recovery failed: {e}")
         pass
 
     rx_events.clear()
     same_payload_count = 0
     same_status_count = 0
+    logging.debug("Recovery counters reset")
 
 
 def rx_handle_if_ready():
-    if LoRa.available() <= 0:
+    available = LoRa.available()
+    if available <= 0:
         return
+
+    logging.debug(f"RX data available: {available} bytes")
 
     buf = bytearray()
     while LoRa.available() > 0:
         buf.append(LoRa.read())
     data = bytes(buf)
+    logging.debug(f"Read {len(data)} bytes from LoRa")
 
+    purge_success = False
     try:
         LoRa.purge()
-    except:
+        purge_success = True
+        logging.debug("LoRa.purge() successful")
+    except Exception as e:
+        logging.error(f"!!! LoRa.purge() FAILED: {e} - triggering soft restart !!!")
         LoRa._payloadTxRx = 0
+        lora_soft_restart_and_apply(cfg)
 
     try:
         st = LoRa.status()
         st = int(st) if isinstance(st, int) else st
-    except Exception:
+        logging.debug(f"LoRa status: {st}")
+    except Exception as e:
+        logging.warning(f"Failed to read LoRa status: {e}")
         st = None
 
     now = time.time()
@@ -374,7 +467,9 @@ def rx_handle_if_ready():
 
     try:
         rssi = float(LoRa.packetRssi())
-    except Exception:
+        logging.debug(f"Packet RSSI: {rssi} dBm")
+    except Exception as e:
+        logging.debug(f"Failed to read RSSI: {e}")
         rssi = None
 
     try:
@@ -386,8 +481,20 @@ def rx_handle_if_ready():
             if q >= 128:
                 q -= 256
             snr = q / 4.0
-    except Exception:
+        logging.debug(f"Packet SNR: {snr} dB")
+    except Exception as e:
+        logging.debug(f"Failed to read SNR: {e}")
         snr = None
+
+    status_name = {0: "DEFAULT", 1: "TX_WAIT", 2: "TX_TIMEOUT", 3: "TX_DONE",
+                   4: "RX_WAIT", 5: "RX_CONTINUOUS", 6: "RX_TIMEOUT", 7: "RX_DONE",
+                   8: "HEADER_ERR", 9: "CRC_ERR", 10: "CAD_WAIT", 11: "CAD_DETECTED", 12: "CAD_DONE"}.get(st, "UNKNOWN")
+
+    logging.info(f"RX packet: status={st:02d if st is not None else 'FF'} ({status_name}), len={len(data)}, rssi={rssi}, snr={snr}, purge_ok={purge_success}")
+
+    if len(data) > 0:
+        logging.debug(f"  Payload HEX: {binascii.hexlify(data).decode('ascii')[:100]}...")
+        logging.debug(f"  Payload ASCII: {ascii_safe_preview(data, 50)}")
 
     mqtt_publish(MQTT_TOPIC_RX, {
         "timestamp": now_iso(),
@@ -399,43 +506,58 @@ def rx_handle_if_ready():
     })
 
 def do_tx_now(mode, data_bytes):
+    logging.info(f"Starting TX: mode={mode}, len={len(data_bytes)} bytes")
+    logging.debug(f"TX data HEX: {binascii.hexlify(data_bytes).decode('ascii')}")
     st = None
     try:
         set_tx_iq(cfg)
+        logging.debug("Begin packet transmission")
         LoRa.beginPacket()
         for b in data_bytes:
             LoRa.write(b)
         LoRa.endPacket()
+        logging.debug("Packet queued, waiting for TX completion")
         tx_start = time.time()
         while True:
              if LoRa.wait(WAIT_TIMEOUT_S):
                  try:
                      st = LoRa.status()
-                 except Exception:
+                 except Exception as e:
+                     logging.warning(f"Failed to read TX status: {e}")
                      st = None
                  if st is not None:
                      st = int(st) if isinstance(st, int) else st
+                     logging.debug(f"TX status received: {st}")
                      break
 
              if time.time() - tx_start > TX_TIMEOUT_S:
+                 logging.error(f"TX timeout after {TX_TIMEOUT_S}s")
                  st = 2
                  break
 
              time.sleep(WAIT_SLEEP_S)
 
-    except Exception:
+    except Exception as e:
+        logging.error(f"TX exception: {e}")
         st = None
     finally:
         set_rx_iq(cfg)
         try:
             LoRa.request(LoRa.RX_CONTINUOUS)
-        except Exception:
+            logging.debug("Returned to RX_CONTINUOUS mode after TX")
+        except Exception as e:
+            logging.error(f"Failed to return to RX_CONTINUOUS: {e}")
             pass
 
     try:
         tx_time = round(LoRa.transmitTime(), 1)
-    except Exception:
+        logging.debug(f"TX time: {tx_time} ms")
+    except Exception as e:
+        logging.warning(f"Failed to read TX time: {e}")
         tx_time = 0.0
+
+    status_name = {0: "DEFAULT", 1: "TX_WAIT", 2: "TX_TIMEOUT", 3: "TX_DONE"}.get(st, "UNKNOWN")
+    logging.info(f"TX completed: status={st:02d if st is not None else 'FF'} ({status_name}), time={tx_time}ms")
 
     mqtt_publish(MQTT_TOPIC_TX_ACK, {
         "timestamp": now_iso(),
@@ -451,8 +573,10 @@ def check_and_apply_config(last_cfg_check):
     if now - last_cfg_check < CONFIG_POLL_SEC:
         return last_cfg_check
 
+    logging.debug("Checking for config file changes...")
     newc, newh, changed = cfg_load_if_changed(cfg_hash)
     if changed:
+        logging.warning(f"Config file changed detected! Old hash: {cfg_hash[:8]}..., new hash: {newh[:8]}...")
         cfg = newc
         cfg_hash = newh
         lora_soft_restart_and_apply(cfg)
@@ -461,6 +585,9 @@ def check_and_apply_config(last_cfg_check):
             "timestamp": now_iso(),
             "status_code": 13,
         })
+        logging.info("Config reloaded and applied")
+    else:
+        logging.debug("No config changes detected")
 
     return now
 
@@ -468,6 +595,9 @@ def check_and_apply_config(last_cfg_check):
 def main():
     global LoRa, mqtt_client, cfg, cfg_hash, tx_pending, tx_mode, tx_bytes_buf
 
+    setup_logging()
+
+    logging.info("=== Starting LoRa Gateway Initialization ===")
     cfg = cfg_load()
     cfg_hash = _dict_hash(cfg)
 
@@ -477,14 +607,24 @@ def main():
     set_rx_iq(cfg)
     try:
         LoRa.request(LoRa.RX_CONTINUOUS)
-    except Exception:
+        logging.info("LoRa module set to RX_CONTINUOUS mode")
+    except Exception as e:
+        logging.error(f"Failed to set RX_CONTINUOUS mode: {e}")
         pass
 
     last_cfg_check = 0.0
 
+    logging.info("=== Gateway Initialized Successfully - Entering Main Loop ===")
+    loop_count = 0
+
     try:
         while True:
+            loop_count += 1
+            if loop_count % 1000 == 0:
+                logging.debug(f"Main loop iteration: {loop_count}")
+
             if tx_pending:
+                logging.debug("TX request pending, processing...")
                 mode = tx_mode
                 data = tx_bytes_buf
                 tx_pending = False
@@ -500,13 +640,22 @@ def main():
             last_cfg_check = check_and_apply_config(last_cfg_check)
 
     except KeyboardInterrupt:
+        logging.info("Keyboard interrupt received, shutting down...")
         pass
+    except Exception as e:
+        logging.error(f"!!! FATAL ERROR in main loop: {e}", exc_info=True)
+        raise
     finally:
+        logging.info("Shutting down gateway...")
         try:
             mqtt_client.loop_stop()
             mqtt_client.disconnect()
-        except Exception:
+            logging.info("MQTT client disconnected")
+        except Exception as e:
+            logging.error(f"Error during shutdown: {e}")
             pass
+        logging.info("=== Gateway Stopped ===")
+        logging.info(f"Total main loop iterations: {loop_count}")
 
 if __name__ == "__main__":
     main()
