@@ -1,18 +1,5 @@
-#    STATUS_DEFAULT                         = 0
-#    STATUS_TX_WAIT                         = 1
-#    STATUS_TX_TIMEOUT                      = 2
-#    STATUS_TX_DONE                         = 3
-#    STATUS_RX_WAIT                         = 4
-#    STATUS_RX_CONTINUOUS                   = 5
-#    STATUS_RX_TIMEOUT                      = 6
-#    STATUS_RX_DONE                         = 7
-#    STATUS_HEADER_ERR                      = 8
-#    STATUS_CRC_ERR                         = 9
-#    STATUS_CAD_WAIT                        = 10
-#    STATUS_CAD_DETECTED                    = 11
-#    STATUS_CAD_DONE                        = 12
-
-
+from __future__ import annotations
+from typing import Optional, Dict, Any, Tuple
 
 from LoRaRF import SX127x
 import time
@@ -25,6 +12,37 @@ import paho.mqtt.client as mqtt
 import RPi.GPIO as GPIO
 import logging
 import os
+
+# LoRa Status Codes
+STATUS_DEFAULT = 0
+STATUS_TX_WAIT = 1
+STATUS_TX_TIMEOUT = 2
+STATUS_TX_DONE = 3
+STATUS_RX_WAIT = 4
+STATUS_RX_CONTINUOUS = 5
+STATUS_RX_TIMEOUT = 6
+STATUS_RX_DONE = 7
+STATUS_HEADER_ERR = 8
+STATUS_CRC_ERR = 9
+STATUS_CAD_WAIT = 10
+STATUS_CAD_DETECTED = 11
+STATUS_CAD_DONE = 12
+
+STATUS_NAMES = {
+    STATUS_DEFAULT: "DEFAULT",
+    STATUS_TX_WAIT: "TX_WAIT",
+    STATUS_TX_TIMEOUT: "TX_TIMEOUT",
+    STATUS_TX_DONE: "TX_DONE",
+    STATUS_RX_WAIT: "RX_WAIT",
+    STATUS_RX_CONTINUOUS: "RX_CONTINUOUS",
+    STATUS_RX_TIMEOUT: "RX_TIMEOUT",
+    STATUS_RX_DONE: "RX_DONE",
+    STATUS_HEADER_ERR: "HEADER_ERR",
+    STATUS_CRC_ERR: "CRC_ERR",
+    STATUS_CAD_WAIT: "CAD_WAIT",
+    STATUS_CAD_DETECTED: "CAD_DETECTED",
+    STATUS_CAD_DONE: "CAD_DONE"
+}
 
 LOG_DIR = "logs"
 LOG_FILE = None
@@ -74,7 +92,13 @@ last_payload_hash = None
 same_payload_count = 0
 last_status = None
 same_status_count = 0
+last_rx_time = 0.0
 
+
+
+# =============================================================================
+# LOGGING AND UTILITY FUNCTIONS
+# =============================================================================
 
 def setup_logging():
     global LOG_FILE
@@ -87,19 +111,37 @@ def setup_logging():
     logging.basicConfig(
         level=logging.DEBUG,
         format='%(asctime)s [%(levelname)s] %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S.%f',
+        datefmt='%Y-%m-%d %H:%M:%S',
         handlers=[
-            logging.FileHandler(LOG_FILE, encoding='utf-8'),
-            logging.StreamHandler()
+            logging.FileHandler(LOG_FILE, encoding='utf-8')
         ]
     )
     logging.info(f"=== LoRa Gateway Started ===")
     logging.info(f"Log file: {LOG_FILE}")
 
-def now_iso():
+
+def now_iso() -> str:
+    """Get current ISO timestamp in Europe/Prague timezone.
+
+    Returns:
+        ISO 8601 formatted timestamp string.
+    """
     return datetime.now(ZoneInfo("Europe/Prague")).isoformat()
 
-def ascii_safe_preview(b, max_len=256):
+
+def ascii_safe_preview(b: bytes, max_len: int = 256) -> str:
+    """Convert bytes to ASCII-safe preview string.
+
+    Non-printable characters are shown as hex escapes (\\xNN).
+    Long strings are truncated with ellipsis.
+
+    Args:
+        b: Bytes to preview.
+        max_len: Maximum length before truncation.
+
+    Returns:
+        ASCII-safe preview string.
+    """
     out = []
     for x in b[:max_len]:
         if 32 <= x <= 126 or x in (9, 10, 13):
@@ -110,14 +152,35 @@ def ascii_safe_preview(b, max_len=256):
         out.append("…")
     return "".join(out)
 
-def compute_rssi(pkt_rssi_dbm, pkt_snr_db):
+def compute_rssi(pkt_rssi_dbm: Optional[float], pkt_snr_db: Optional[float]) -> Optional[float]:
+    """Compute corrected RSSI value considering SNR.
+
+    When SNR is negative, RSSI needs correction as per LoRa specifications.
+
+    Args:
+        pkt_rssi_dbm: Raw RSSI value in dBm.
+        pkt_snr_db: SNR value in dB.
+
+    Returns:
+        Corrected RSSI value in dBm, or None if input is None.
+    """
     if pkt_rssi_dbm is None:
         return None
     if pkt_snr_db is None or pkt_snr_db >= 0:
         return float(pkt_rssi_dbm)
     return float(pkt_rssi_dbm) + (float(pkt_snr_db) * 0.25)
 
-def cfg_defaults():
+
+# =============================================================================
+# CONFIGURATION MANAGEMENT
+# =============================================================================
+
+def cfg_defaults() -> Dict[str, Any]:
+    """Get default LoRa configuration for 169 MHz ISM band.
+
+    Returns:
+        Dictionary with default configuration values.
+    """
     return {
         "freq_hz": 169437500,
         "sf": 12,
@@ -223,6 +286,78 @@ def map_pa(pa_str):
     return SX127x.TX_POWER_PA_BOOST if str(pa_str).lower() == "pa_boost" else SX127x.TX_POWER_RFO
 
 
+# =============================================================================
+# LORA PACKET METADATA HELPERS
+# =============================================================================
+
+def read_packet_rssi() -> Optional[float]:
+    """Read RSSI for the last received packet.
+
+    Returns:
+        RSSI value in dBm, or None if reading failed.
+    """
+    try:
+        rssi = float(LoRa.packetRssi())
+        logging.debug(f"Packet RSSI: {rssi} dBm")
+        return rssi
+    except Exception as e:
+        logging.debug(f"Failed to read RSSI: {e}")
+        return None
+
+
+def read_packet_snr() -> Optional[float]:
+    """Read SNR for the last received packet.
+
+    The raw SNR value from the chip is converted to proper dB scale.
+
+    Returns:
+        SNR value in dB, or None if reading failed.
+    """
+    try:
+        snr_bind = LoRa.snr()
+        if snr_bind is None:
+            return None
+
+        # Convert to proper SNR value
+        q = int(round(float(snr_bind) * 4.0)) & 0xFF
+        if q >= 128:
+            q -= 256
+        snr = q / 4.0
+        logging.debug(f"Packet SNR: {snr} dB")
+        return snr
+    except Exception as e:
+        logging.debug(f"Failed to read SNR: {e}")
+        return None
+
+
+def get_status_name(status_code: Optional[int]) -> str:
+    """Get human-readable name for LoRa status code.
+
+    Args:
+        status_code: Numeric status code (0-12).
+
+    Returns:
+        Status name string (e.g., "RX_DONE", "CRC_ERR").
+    """
+    return STATUS_NAMES.get(status_code, "UNKNOWN")
+
+
+def format_status_code(status_code: Optional[int]) -> str:
+    """Format status code as 2-digit decimal string.
+
+    Args:
+        status_code: Numeric status code.
+
+    Returns:
+        Formatted string (e.g., "07", "09", "FF" for None).
+    """
+    return f"{int(status_code):02d}" if status_code is not None else "FF"
+
+
+# =============================================================================
+# LORA MODULE INITIALIZATION AND CONFIGURATION
+# =============================================================================
+
 def lora_init():
     logging.info("Initializing LoRa module...")
     logging.debug(f"GPIO setup: RST_PIN={RST_PIN}, DIO0_PIN={DIO0_PIN}")
@@ -291,12 +426,13 @@ def set_tx_iq(c):
         pass
 
 def lora_soft_restart_and_apply(c):
+    """Perform LoRa module soft restart and reapply configuration."""
     logging.warning("Performing LoRa soft restart...")
     try:
-        LoRa.restart()
-        logging.debug("LoRa restart() successful")
+        LoRa.reset()
+        logging.debug("LoRa reset() successful - hardware reset completed")
     except Exception as e:
-        logging.warning(f"LoRa restart() failed: {e}, trying sleep/wake")
+        logging.error(f"LoRa reset() failed: {e}, trying sleep/wake fallback")
         try:
             LoRa.sleep()
             time.sleep(0.02)
@@ -305,14 +441,11 @@ def lora_soft_restart_and_apply(c):
         except Exception as e2:
             logging.error(f"LoRa sleep/wake failed: {e2}")
             pass
-    time.sleep(0.02)
 
-    try:
-        LoRa.init()
-        logging.debug("LoRa init() successful")
-    except Exception as e:
-        logging.warning(f"LoRa init() failed: {e}, trying begin()")
-        LoRa.begin()
+    time.sleep(0.02)
+    LoRa.begin()
+    logging.debug("LoRa begin() successful - module reinitialized")
+
     lora_apply_common(c)
     set_rx_iq(c)
     time.sleep(0.02)
@@ -323,6 +456,10 @@ def lora_soft_restart_and_apply(c):
         logging.error(f"Failed to set RX_CONTINUOUS after restart: {e}")
         pass
 
+
+# =============================================================================
+# MQTT CLIENT INITIALIZATION AND HANDLERS
+# =============================================================================
 
 def mqtt_init():
     logging.info("Initializing MQTT client...")
@@ -370,12 +507,41 @@ def on_mqtt_message(client, userdata, msg):
         tx_pending = True
 
 
-def detect_rx_loop(now, payload_hash, st):
+
+# =============================================================================
+# RX LOOP DETECTION AND RECOVERY
+# =============================================================================
+
+def detect_rx_loop(now: float, payload_hash: bytes, st: Optional[int]) -> bool:
+    """Detect infinite RX loops based on rate, payload, and status.
+
+    Uses multiple detection heuristics:
+    - High packet rate (>20 packets/sec)
+    - Extreme packet rate (>100 packets/sec)
+    - Repeated identical payloads
+    - Repeated status codes
+
+    Args:
+        now: Current timestamp.
+        payload_hash: MD5 hash of received payload.
+        st: LoRa status code.
+
+    Returns:
+        True if loop detected, False otherwise.
+    """
     global rx_events, last_payload_hash, same_payload_count
-    global last_status, same_status_count
+    global last_status, same_status_count, last_rx_time
 
     rx_events.append(now)
     rx_events[:] = [t for t in rx_events if now - t < RX_RATE_WINDOW]
+
+    # Reset counters if too much time passed since last RX (outside the rate window)
+    if last_rx_time > 0 and (now - last_rx_time) > RX_RATE_WINDOW:
+        same_payload_count = 0
+        same_status_count = 0
+        logging.debug(f"Counters reset due to time gap: {now - last_rx_time:.2f}s")
+
+    last_rx_time = now
 
     if payload_hash == last_payload_hash:
         same_payload_count += 1
@@ -408,8 +574,16 @@ def detect_rx_loop(now, payload_hash, st):
     return False
 
 
-def perform_rx_recovery():
-    global rx_events, same_payload_count, same_status_count
+def perform_rx_recovery() -> None:
+    """Perform recovery when RX loop is detected.
+
+    Recovery process:
+    1. Perform LoRa module soft restart
+    2. Reapply configuration
+    3. Reset all loop detection counters
+    4. Return to RX_CONTINUOUS mode
+    """
+    global rx_events, same_payload_count, same_status_count, last_rx_time
 
     logging.warning("!!! PERFORMING RX RECOVERY DUE TO LOOP DETECTION !!!")
     try:
@@ -422,10 +596,32 @@ def perform_rx_recovery():
     rx_events.clear()
     same_payload_count = 0
     same_status_count = 0
+    last_rx_time = 0.0
     logging.debug("Recovery counters reset")
 
 
-def rx_handle_if_ready():
+# =============================================================================
+# RX PACKET HANDLING
+# =============================================================================
+
+def rx_handle_if_ready() -> None:
+    """Handle incoming RX data if available.
+
+    Processing flow:
+    1. Check if data is available
+    2. Read all bytes from FIFO
+    3. Check LoRa status
+    4. Handle CRC_ERR (immediate restart)
+    5. Purge FIFO buffer
+    6. Detect potential RX loops
+    7. Read packet metadata (RSSI/SNR)
+    8. Publish packet to MQTT
+
+    Special cases:
+    - CRC_ERR: Triggers immediate module restart
+    - Purge failure: Triggers module restart
+    - Loop detection: Triggers recovery procedure
+    """
     available = LoRa.available()
     if available <= 0:
         return
@@ -438,6 +634,36 @@ def rx_handle_if_ready():
     data = bytes(buf)
     logging.debug(f"Read {len(data)} bytes from LoRa")
 
+    try:
+        st = LoRa.status()
+        st = int(st) if isinstance(st, int) else st
+        logging.debug(f"LoRa status: {st}")
+    except Exception as e:
+        logging.warning(f"Failed to read LoRa status: {e}")
+        st = None
+
+    # Check for CRC_ERR BEFORE purging - this state requires full restart
+    if st == STATUS_CRC_ERR:
+        logging.error(f"!!! RX status CRC_ERR detected - buffer stuck, triggering immediate restart !!!")
+
+        # Read packet metadata for error tracking
+        rssi = read_packet_rssi()
+        snr = read_packet_snr()
+
+        # Publish CRC error to MQTT with the corrupted data for analysis
+        mqtt_publish(MQTT_TOPIC_RX, {
+            "timestamp": now_iso(),
+            "status_code": format_status_code(st),
+            "rssi": compute_rssi(rssi, snr),
+            "snr": snr,
+            "payload_hex": binascii.hexlify(data).decode("ascii") if len(data) > 0 else "",
+            "payload_ascii": ascii_safe_preview(data) if len(data) > 0 else "",
+        })
+
+        LoRa._payloadTxRx = 0
+        lora_soft_restart_and_apply(cfg)
+        return  # Skip further processing after restart
+
     purge_success = False
     try:
         LoRa.purge()
@@ -447,14 +673,7 @@ def rx_handle_if_ready():
         logging.error(f"!!! LoRa.purge() FAILED: {e} - triggering soft restart !!!")
         LoRa._payloadTxRx = 0
         lora_soft_restart_and_apply(cfg)
-
-    try:
-        st = LoRa.status()
-        st = int(st) if isinstance(st, int) else st
-        logging.debug(f"LoRa status: {st}")
-    except Exception as e:
-        logging.warning(f"Failed to read LoRa status: {e}")
-        st = None
+        return
 
     now = time.time()
     payload_hash = hashlib.md5(data).digest()[:4] if len(data) > 0 else b"\x00\x00\x00\x00"
@@ -465,47 +684,56 @@ def rx_handle_if_ready():
         perform_rx_recovery()
         return
 
-    try:
-        rssi = float(LoRa.packetRssi())
-        logging.debug(f"Packet RSSI: {rssi} dBm")
-    except Exception as e:
-        logging.debug(f"Failed to read RSSI: {e}")
-        rssi = None
+    # Read packet metadata
+    rssi = read_packet_rssi()
+    snr = read_packet_snr()
 
-    try:
-        snr_bind = LoRa.snr()
-        if snr_bind is None:
-            snr = None
-        else:
-            q = int(round(float(snr_bind) * 4.0)) & 0xFF
-            if q >= 128:
-                q -= 256
-            snr = q / 4.0
-        logging.debug(f"Packet SNR: {snr} dB")
-    except Exception as e:
-        logging.debug(f"Failed to read SNR: {e}")
-        snr = None
-
-    status_name = {0: "DEFAULT", 1: "TX_WAIT", 2: "TX_TIMEOUT", 3: "TX_DONE",
-                   4: "RX_WAIT", 5: "RX_CONTINUOUS", 6: "RX_TIMEOUT", 7: "RX_DONE",
-                   8: "HEADER_ERR", 9: "CRC_ERR", 10: "CAD_WAIT", 11: "CAD_DETECTED", 12: "CAD_DONE"}.get(st, "UNKNOWN")
-
-    logging.info(f"RX packet: status={st:02d if st is not None else 'FF'} ({status_name}), len={len(data)}, rssi={rssi}, snr={snr}, purge_ok={purge_success}")
+    # Log packet information
+    status_name = get_status_name(st)
+    status_str = format_status_code(st)
+    logging.info(f"RX packet: status={status_str} ({status_name}), len={len(data)}, rssi={rssi}, snr={snr}, purge_ok={purge_success}")
 
     if len(data) > 0:
         logging.debug(f"  Payload HEX: {binascii.hexlify(data).decode('ascii')[:100]}...")
         logging.debug(f"  Payload ASCII: {ascii_safe_preview(data, 50)}")
 
+    # Publish to MQTT
     mqtt_publish(MQTT_TOPIC_RX, {
         "timestamp": now_iso(),
-        "status_code": f"{int(st):02d}" if st is not None else "FF",
+        "status_code": format_status_code(st),
         "rssi": compute_rssi(rssi, snr),
         "snr": snr,
         "payload_hex": binascii.hexlify(data).decode("ascii") if len(data) > 0 else "",
         "payload_ascii": ascii_safe_preview(data) if len(data) > 0 else ""
     })
 
-def do_tx_now(mode, data_bytes):
+
+# =============================================================================
+# TX PACKET HANDLING
+# =============================================================================
+
+def do_tx_now(mode: str, data_bytes: bytes) -> None:
+    """Transmit data packet and handle TX completion.
+
+    Transmit flow:
+    1. Set TX IQ configuration
+    2. Begin packet transmission
+    3. Write data bytes
+    4. End packet and wait for completion
+    5. Handle TX timeout
+    6. Return to RX_CONTINUOUS mode
+    7. Read TX metadata (transmit time)
+    8. Publish TX ACK to MQTT
+
+    Special cases:
+    - TX timeout: Status set to TX_TIMEOUT
+    - CRC_ERR on TX: Triggers module restart
+    - Exceptions: Logged and handled gracefully
+
+    Args:
+        mode: Transmission mode ("hex" or "ascii").
+        data_bytes: Data to transmit.
+    """
     logging.info(f"Starting TX: mode={mode}, len={len(data_bytes)} bytes")
     logging.debug(f"TX data HEX: {binascii.hexlify(data_bytes).decode('ascii')}")
     st = None
@@ -532,7 +760,7 @@ def do_tx_now(mode, data_bytes):
 
              if time.time() - tx_start > TX_TIMEOUT_S:
                  logging.error(f"TX timeout after {TX_TIMEOUT_S}s")
-                 st = 2
+                 st = STATUS_TX_TIMEOUT
                  break
 
              time.sleep(WAIT_SLEEP_S)
@@ -556,17 +784,30 @@ def do_tx_now(mode, data_bytes):
         logging.warning(f"Failed to read TX time: {e}")
         tx_time = 0.0
 
-    status_name = {0: "DEFAULT", 1: "TX_WAIT", 2: "TX_TIMEOUT", 3: "TX_DONE"}.get(st, "UNKNOWN")
-    logging.info(f"TX completed: status={st:02d if st is not None else 'FF'} ({status_name}), time={tx_time}ms")
+    # Log TX completion
+    status_name = get_status_name(st)
+    status_str = format_status_code(st)
+    logging.info(f"TX completed: status={status_str} ({status_name}), time={tx_time}ms")
 
+    # If TX returned CRC_ERR status, perform soft restart to recover
+    if st == STATUS_CRC_ERR:
+        logging.error("TX returned CRC_ERR status - abnormal state detected, triggering recovery")
+        lora_soft_restart_and_apply(cfg)
+
+    # Publish TX acknowledgment to MQTT
     mqtt_publish(MQTT_TOPIC_TX_ACK, {
         "timestamp": now_iso(),
-        "status_code": f"{int(st):02d}" if st is not None else "FF",
+        "status_code": format_status_code(st),
         "transmit_time": tx_time,
     })
 
 
+# =============================================================================
+# CONFIGURATION RELOAD
+# =============================================================================
+
 def check_and_apply_config(last_cfg_check):
+    """Check for configuration file changes and apply if changed."""
     global cfg, cfg_hash
 
     now = time.time()
@@ -592,7 +833,12 @@ def check_and_apply_config(last_cfg_check):
     return now
 
 
+# =============================================================================
+# MAIN PROGRAM
+# =============================================================================
+
 def main():
+    """Main gateway loop."""
     global LoRa, mqtt_client, cfg, cfg_hash, tx_pending, tx_mode, tx_bytes_buf
 
     setup_logging()
