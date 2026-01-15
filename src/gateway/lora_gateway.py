@@ -61,7 +61,7 @@ SPI_BUS = 0
 SPI_CS  = 0
 RST_PIN = 25
 DIO0_PIN= 5
-SPI_HZ  = 7_800_000
+SPI_HZ  = 2_000_000
 
 CONFIG_PATH = "config.json"
 CONFIG_POLL_SEC = 30
@@ -78,6 +78,12 @@ RX_SAME_PAYLOAD_EXTREME = 20
 RECOVERY_SLEEP_S = 0.05
 TX_TIMEOUT_S = 60
 
+# RX Mode Watchdog settings
+RX_MODE_CHECK_INTERVAL_S = 10.0
+RX_MODE_CHECK_MAX_FAILURES = 3
+RX_ACTIVITY_WATCHDOG_TIMEOUT_S = 300.0
+RX_PERIODIC_STATUS_LOG_INTERVAL_S = 100.0
+
 LoRa = None
 mqtt_client = None
 cfg = None
@@ -93,6 +99,11 @@ same_payload_count = 0
 last_status = None
 same_status_count = 0
 last_rx_time = 0.0
+
+last_mode_check_time = 0.0
+mode_check_failure_count = 0
+last_rx_activity_time = 0.0
+last_periodic_status_log_time = 0.0
 
 
 
@@ -426,7 +437,12 @@ def set_tx_iq(c):
         pass
 
 def lora_soft_restart_and_apply(c):
-    """Perform LoRa module soft restart and reapply configuration."""
+    """Perform LoRa module soft restart and reapply configuration.
+
+    Also resets RX activity watchdog and mode check counters.
+    """
+    global last_rx_activity_time, mode_check_failure_count
+
     logging.warning("Performing LoRa soft restart...")
     try:
         LoRa.reset()
@@ -455,6 +471,11 @@ def lora_soft_restart_and_apply(c):
     except Exception as e:
         logging.error(f"Failed to set RX_CONTINUOUS after restart: {e}")
         pass
+
+    # Reset watchdog timers and counters after successful restart
+    last_rx_activity_time = time.time()
+    mode_check_failure_count = 0
+    logging.debug("Watchdog timers and counters reset after soft restart")
 
 
 # =============================================================================
@@ -506,6 +527,174 @@ def on_mqtt_message(client, userdata, msg):
         tx_bytes_buf = bytes(msg.payload)
         tx_pending = True
 
+
+
+# =============================================================================
+# RX MODE WATCHDOG AND ACTIVITY MONITORING
+# =============================================================================
+
+def check_rx_mode() -> bool:
+    """Check if LoRa module is in correct RX_CONTINUOUS mode.
+
+    Reads the hardware operation mode register and verifies the module
+    is in RX_CONTINUOUS mode (0x05). If not, attempts to restore it.
+
+    Returns:
+        True if mode is correct or successfully restored, False otherwise.
+    """
+    try:
+        current_mode = LoRa.readRegister(LoRa.REG_OP_MODE) & 0x07
+        logging.debug(f"RX mode check: current={current_mode}, expected={LoRa.MODE_RX_CONTINUOUS}")
+
+        if current_mode != LoRa.MODE_RX_CONTINUOUS:
+            logging.warning(f"RX mode mismatch! Expected {LoRa.MODE_RX_CONTINUOUS} (RX_CONTINUOUS), got {current_mode}")
+            return False
+
+        return True
+    except Exception as e:
+        logging.error(f"Failed to read RX mode: {e}")
+        return False
+
+
+def restore_rx_mode() -> bool:
+    """Attempt to restore RX_CONTINUOUS mode.
+
+    First tries using request() method. If that fails, performs
+    a full soft restart of the LoRa module.
+
+    Returns:
+        True if restoration succeeded, False otherwise.
+    """
+    logging.warning("Attempting to restore RX_CONTINUOUS mode...")
+
+    try:
+        # First attempt: use request() to restore RX mode
+        success = LoRa.request(LoRa.RX_CONTINUOUS)
+
+        if success:
+            logging.info("RX mode restored successfully using request()")
+            return True
+        else:
+            logging.warning("request() returned False, mode may already be set or failed")
+
+            # Verify if mode is correct now
+            current_mode = LoRa.readRegister(LoRa.REG_OP_MODE) & 0x07
+            if current_mode == LoRa.MODE_RX_CONTINUOUS:
+                logging.info("RX mode verified correct after request()")
+                return True
+
+            logging.error("request() failed to restore RX mode, performing soft restart")
+            lora_soft_restart_and_apply(cfg)
+            logging.info("Soft restart completed")
+            return True
+
+    except Exception as e:
+        logging.error(f"Failed to restore RX mode: {e}, performing soft restart")
+        try:
+            lora_soft_restart_and_apply(cfg)
+            logging.info("Soft restart completed after exception")
+            return True
+        except Exception as e2:
+            logging.error(f"Soft restart also failed: {e2}")
+            return False
+
+
+def check_and_restore_rx_mode(now: float) -> float:
+    """Periodic check and restoration of RX mode.
+
+    Checks hardware RX mode every RX_MODE_CHECK_INTERVAL_S seconds.
+    If mode is incorrect, attempts restoration. After multiple failures,
+    performs a soft restart.
+
+    Args:
+        now: Current timestamp.
+
+    Returns:
+        Updated last mode check timestamp.
+    """
+    global last_mode_check_time, mode_check_failure_count
+
+    if now - last_mode_check_time < RX_MODE_CHECK_INTERVAL_S:
+        return last_mode_check_time
+
+    last_mode_check_time = now
+
+    if not check_rx_mode():
+        mode_check_failure_count += 1
+        logging.warning(f"RX mode check failed (failure count: {mode_check_failure_count})")
+
+        if mode_check_failure_count >= RX_MODE_CHECK_MAX_FAILURES:
+            logging.error(f"Multiple consecutive mode check failures ({mode_check_failure_count}), performing soft restart")
+            lora_soft_restart_and_apply(cfg)
+            mode_check_failure_count = 0
+        else:
+            restore_rx_mode()
+    else:
+        # Reset failure counter on successful check
+        if mode_check_failure_count > 0:
+            logging.debug(f"RX mode check passed, resetting failure counter from {mode_check_failure_count}")
+        mode_check_failure_count = 0
+
+    return now
+
+
+def check_rx_activity_watchdog(now: float) -> None:
+    """Monitor RX activity and restart if no packets received.
+
+    If no RX activity detected for RX_ACTIVITY_WATCHDOG_TIMEOUT_S seconds,
+    performs a soft restart to recover potentially stuck receiver.
+
+    Args:
+        now: Current timestamp.
+    """
+    global last_rx_activity_time
+
+    # Skip check if we haven't received any packets yet
+    if last_rx_activity_time == 0.0:
+        return
+
+    time_since_last_rx = now - last_rx_activity_time
+
+    if time_since_last_rx > RX_ACTIVITY_WATCHDOG_TIMEOUT_S:
+        logging.warning(f"!!! RX ACTIVITY WATCHDOG TIMEOUT !!!")
+        logging.warning(f"No RX activity for {time_since_last_rx:.0f} seconds (threshold: {RX_ACTIVITY_WATCHDOG_TIMEOUT_S}s)")
+        logging.warning("Performing soft restart to recover potentially stuck receiver...")
+
+        lora_soft_restart_and_apply(cfg)
+        last_rx_activity_time = now
+        logging.info("Soft restart completed, RX activity timer reset")
+
+
+def log_periodic_rx_status(now: float) -> float:
+    """Log periodic RX status for monitoring.
+
+    Logs current RX mode and time since last activity every
+    RX_PERIODIC_STATUS_LOG_INTERVAL_S seconds for debugging.
+
+    Args:
+        now: Current timestamp.
+
+    Returns:
+        Updated last periodic status log timestamp.
+    """
+    global last_periodic_status_log_time
+
+    if now - last_periodic_status_log_time < RX_PERIODIC_STATUS_LOG_INTERVAL_S:
+        return last_periodic_status_log_time
+
+    last_periodic_status_log_time = now
+
+    try:
+        current_mode = LoRa.readRegister(LoRa.REG_OP_MODE) & 0x07
+        time_since_last_rx = now - last_rx_activity_time if last_rx_activity_time > 0 else 0.0
+
+        logging.debug(f"Periodic RX status: mode={current_mode} (expected {LoRa.MODE_RX_CONTINUOUS}), "
+                     f"last_rx_ago={time_since_last_rx:.0f}s, "
+                     f"mode_failures={mode_check_failure_count}")
+    except Exception as e:
+        logging.warning(f"Failed to log periodic RX status: {e}")
+
+    return now
 
 
 # =============================================================================
@@ -584,6 +773,7 @@ def perform_rx_recovery() -> None:
     4. Return to RX_CONTINUOUS mode
     """
     global rx_events, same_payload_count, same_status_count, last_rx_time
+    global last_rx_activity_time
 
     logging.warning("!!! PERFORMING RX RECOVERY DUE TO LOOP DETECTION !!!")
     try:
@@ -597,6 +787,7 @@ def perform_rx_recovery() -> None:
     same_payload_count = 0
     same_status_count = 0
     last_rx_time = 0.0
+    last_rx_activity_time = time.time()
     logging.debug("Recovery counters reset")
 
 
@@ -683,6 +874,10 @@ def rx_handle_if_ready() -> None:
     if loop_detected:
         perform_rx_recovery()
         return
+
+    # Update RX activity watchdog timestamp
+    global last_rx_activity_time
+    last_rx_activity_time = now
 
     # Read packet metadata
     rssi = read_packet_rssi()
@@ -771,8 +966,14 @@ def do_tx_now(mode: str, data_bytes: bytes) -> None:
     finally:
         set_rx_iq(cfg)
         try:
+            # Clear any residual data in FIFO before returning to RX mode
+            # This prevents ghost packets from TX buffer remnants
+            LoRa._payloadTxRx = 0
+            LoRa.purge()
+            time.sleep(0.01)  # Short delay to let hardware settle
+
             LoRa.request(LoRa.RX_CONTINUOUS)
-            logging.debug("Returned to RX_CONTINUOUS mode after TX")
+            logging.debug("Returned to RX_CONTINUOUS mode after TX (FIFO cleared)")
         except Exception as e:
             logging.error(f"Failed to return to RX_CONTINUOUS: {e}")
             pass
@@ -860,6 +1061,12 @@ def main():
 
     last_cfg_check = 0.0
 
+    # Initialize RX activity watchdog - set to current time to avoid false alarm at startup
+    global last_rx_activity_time, last_mode_check_time, last_periodic_status_log_time
+    last_rx_activity_time = time.time()
+    last_mode_check_time = time.time()
+    last_periodic_status_log_time = time.time()
+
     logging.info("=== Gateway Initialized Successfully - Entering Main Loop ===")
     loop_count = 0
 
@@ -876,14 +1083,25 @@ def main():
                 tx_pending = False
                 do_tx_now(mode, data)
 
-            ok = LoRa.wait(WAIT_TIMEOUT_S)
+            # Wait for interrupt (non-blocking check)
+            # IMPORTANT: We check available() REGARDLESS of wait() result
+            # to handle cases where IRQ is missed but data is in FIFO
+            LoRa.wait(WAIT_TIMEOUT_S)
 
-            if ok and LoRa.available() > 0:
+            # Always check if data is available, not just when wait() returns True
+            if LoRa.available() > 0:
                 rx_handle_if_ready()
             else:
                 time.sleep(WAIT_SLEEP_S)
 
+            # Configuration check
             last_cfg_check = check_and_apply_config(last_cfg_check)
+
+            # RX Mode and Activity Watchdog checks
+            now = time.time()
+            check_and_restore_rx_mode(now)
+            check_rx_activity_watchdog(now)
+            log_periodic_rx_status(now)
 
     except KeyboardInterrupt:
         logging.info("Keyboard interrupt received, shutting down...")
