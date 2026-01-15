@@ -92,6 +92,7 @@ cfg_hash = None
 tx_pending = False
 tx_mode = None
 tx_bytes_buf = b""
+tx_enabled = False  # Flag to ignore retained MQTT messages during startup
 
 rx_events = []
 last_payload_hash = None
@@ -507,6 +508,12 @@ def mqtt_publish(topic, obj):
 def on_mqtt_message(client, userdata, msg):
     global tx_pending, tx_mode, tx_bytes_buf
     logging.info(f"MQTT message received on topic: {msg.topic}")
+
+    # Ignore retained messages during startup (before initialization is complete)
+    if not tx_enabled:
+        logging.warning(f"Ignoring MQTT message on {msg.topic} - TX not yet enabled (likely retained message)")
+        return
+
     if msg.topic == MQTT_TOPIC_TXH:
         try:
             payload_str = msg.payload.decode("utf-8").strip()
@@ -1050,14 +1057,18 @@ def main():
 
     mqtt_client = mqtt_init()
     LoRa = lora_init()
-    lora_apply_common(cfg)
-    set_rx_iq(cfg)
-    try:
-        LoRa.request(LoRa.RX_CONTINUOUS)
-        logging.info("LoRa module set to RX_CONTINUOUS mode")
-    except Exception as e:
-        logging.error(f"Failed to set RX_CONTINUOUS mode: {e}")
-        pass
+
+    # Perform full soft restart to ensure clean state (clears FIFO, registers, IRQ flags)
+    lora_soft_restart_and_apply(cfg)
+
+    # Explicitly clear any residual data in FIFO from previous run
+    # This prevents ghost packets at startup
+    LoRa._payloadTxRx = 0
+    LoRa.purge()
+    # Drain any bytes that might still be in the buffer
+    while LoRa.available() > 0:
+        LoRa.read()
+    logging.info("LoRa module initialized with clean state (FIFO cleared)")
 
     last_cfg_check = 0.0
 
@@ -1066,6 +1077,12 @@ def main():
     last_rx_activity_time = time.time()
     last_mode_check_time = time.time()
     last_periodic_status_log_time = time.time()
+
+    # Enable TX processing now that initialization is complete
+    # This prevents retained MQTT messages from triggering TX during startup
+    global tx_enabled
+    tx_enabled = True
+    logging.info("TX processing enabled")
 
     logging.info("=== Gateway Initialized Successfully - Entering Main Loop ===")
     loop_count = 0
